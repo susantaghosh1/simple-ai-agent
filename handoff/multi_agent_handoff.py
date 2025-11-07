@@ -1,4 +1,5 @@
 import os
+import json
 import openai
 from openai import OpenAI
 
@@ -13,7 +14,7 @@ class Agent:
         self.tools = tools or []
 
 def create_handoff_tool(target_agent):
-    """Create a tool definition for handoff to another agent."""
+    """Create a tool definition for handoff to another agent, including a required reason."""
     return {
         "type": "function",
         "function": {
@@ -21,21 +22,34 @@ def create_handoff_tool(target_agent):
             "description": f"Handoff the query to the {target_agent.name} ({target_agent.handoff_description})",
             "parameters": {
                 "type": "object",
-                "properties": {},
-                "required": [],
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Explain the reason for handing off to this agent."
+                    }
+                },
+                "required": ["reason"]
             },
         }
     }
 
-async def run_agent(initial_agent, query):
-    """Custom runner implementation for agents with handoff support.
+async def run_agent(initial_agent, query, tool_functions=None):
+    """Custom runner implementation for agents with handoff support, structured handoff reasons, and general tool call handling.
     
-    This is a simple asynchronous runner that handles agent execution, tool calls (including handoffs),
-    and switches agents when a handoff tool is called. It uses OpenAI's chat completions API directly
-    for full control.
+    This is a simple asynchronous runner that handles agent execution, tool calls (including handoffs with reasons and other general tools),
+    and switches agents when a handoff tool is called. It uses OpenAI's chat completions API directly for full control.
+    The handoff reason is extracted from the tool call arguments (structured as JSON) and inserted into the conversation history for transparency.
+    
+    General tools are executed via the provided tool_functions dict (tool_name -> callable), and their results are appended back to the messages.
+    
+    Args:
+        initial_agent: The starting Agent instance.
+        query: The initial user query.
+        tool_functions: Optional dict of tool_name to callable functions for non-handoff tools.
     
     Returns the final response from the agent.
     """
+    tool_functions = tool_functions or {}
     current_agent = initial_agent
     messages = [
         {"role": "system", "content": current_agent.instructions},
@@ -57,9 +71,14 @@ async def run_agent(initial_agent, query):
             
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
-                # Handle handoff tools
+                # Parse the structured arguments (JSON)
+                arguments = json.loads(tool_call.function.arguments)
+                
                 if tool_name.startswith("handoff_to_"):
+                    # Handle handoff tools specially
                     target_name = tool_name.replace("handoff_to_", "").replace("_", " ").title()
+                    reason = arguments.get("reason", "No reason provided")
+                    
                     # Switch to the target agent (in a real setup, map names to agents)
                     if target_name == "History Tutor":
                         current_agent = history_tutor_agent
@@ -68,16 +87,41 @@ async def run_agent(initial_agent, query):
                     else:
                         raise ValueError(f"Unknown handoff target: {target_name}")
                     
+                    # Insert the handoff reason into the conversation history as an assistant message
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"Handing off to {current_agent.name}. Reason: {reason}"
+                    })
+                    
                     # Append a tool response to confirm handoff (required for the API loop)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_name,
-                        "content": "Handoff successful. Now handling with the new agent."
+                        "content": "Handoff successful."
                     })
                     
                     # Update system prompt for the new agent
                     messages[0] = {"role": "system", "content": current_agent.instructions}
+                
+                else:
+                    # Handle general (non-handoff) tools
+                    if tool_name not in tool_functions:
+                        raise ValueError(f"Unknown tool: {tool_name}. No function provided.")
+                    
+                    # Execute the tool function with the arguments
+                    try:
+                        result = tool_functions[tool_name](**arguments)
+                    except Exception as e:
+                        result = f"Error executing tool {tool_name}: {str(e)}"
+                    
+                    # Append the tool result back to messages
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_name,
+                        "content": str(result)
+                    })
             
             # Continue the loop after handling tools
             continue
@@ -98,22 +142,50 @@ math_tutor_agent = Agent(
     instructions="You provide help with math problems. Explain your reasoning at each step and include examples."
 )
 
-# Triage agent with handoff tools
+# Triage agent with handoff tools (now requiring reasons)
 triage_agent = Agent(
     name="Triage Agent",
-    instructions="You determine which agent to use based on the user's homework question. Use the handoff tools to route to the appropriate specialist.",
+    instructions="You determine which agent to use based on the user's homework question. Use the handoff tools to route to the appropriate specialist, and always provide a reason in the tool call.",
     tools=[
         create_handoff_tool(history_tutor_agent),
         create_handoff_tool(math_tutor_agent)
     ]
 )
 
-# Example usage
+# Example: Add a general tool to the Math Tutor for demonstration
+def calculate_expression(expression: str) -> str:
+    """A simple calculator tool that evaluates a math expression safely."""
+    try:
+        from math import sqrt, sin, cos, tan, pi, e  # Import safe math functions
+        result = eval(expression, {"__builtins__": {}}, {"sqrt": sqrt, "sin": sin, "cos": cos, "tan": tan, "pi": pi, "e": e})
+        return f"The result is {result}"
+    except Exception as ex:
+        return f"Error calculating: {str(ex)}"
+
+math_tutor_agent.tools = [{
+    "type": "function",
+    "function": {
+        "name": "calculate_expression",
+        "description": "Evaluate a mathematical expression.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "The math expression to evaluate (e.g., '2 + 2')."}
+            },
+            "required": ["expression"]
+        }
+    }
+}]
+
+# Example usage with tool_functions
 import asyncio
 
 async def main():
-    query = "What is the capital of France?"
-    result = await run_agent(triage_agent, query)
+    query = "What is the square root of 16?"  # This should handoff to Math Tutor and use the calculate tool
+    tool_functions = {
+        "calculate_expression": calculate_expression
+    }
+    result = await run_agent(triage_agent, query, tool_functions=tool_functions)
     print(result)
 
 if __name__ == "__main__":
